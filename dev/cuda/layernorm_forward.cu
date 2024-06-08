@@ -337,6 +337,69 @@ __global__ void layernorm_forward_kernel5(float* __restrict__ out, float* __rest
     }
 }
 
+
+// Like 3, but use registers to store the intermediate results and vectorize the loads/stores from global memory 
+__global__ void layernorm_forward_kernel6(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+                                    const float*  __restrict__ inp, const float*  __restrict__ weight,
+                                    const float* __restrict__ bias, int N, int C) {
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    // meta_group_size is the number of warps in a block, and meta_group_rank is the warp index
+    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    if(idx >= N) {
+        return;
+    }
+
+    // the row of input that this group of threads is responsible for
+    const float* x = inp + idx * C;
+
+    // mean
+    float sum = 0.0f;
+    //registers for current thread. since C is 768 and each thread loads 4 floats coalascendly, 
+    //so we need 768/4 = 192 times loading, and there are 32 threads in a warp, 
+    //so we need 192/32 = 6 registers to hold the value from global memory
+    float4 reg_tmp[6] = {0.0f}; 
+    for (int i = warp.thread_rank(), j = 0; i < C / 4; i += warp.size(), j++) {
+        //The compiler will automatically coalesce the 4 float loads into a single 128-bit load
+        reg_tmp[j] = (reinterpret_cast<const float4*>(x))[i];
+        sum += reg_tmp[j].x + reg_tmp[j].y + reg_tmp[j].z + reg_tmp[j].w;
+    }
+    
+    sum = cg::reduce(warp, sum, cg::plus<float>{});
+
+    float m = sum / C;
+    if(warp.thread_rank() == 0 && mean != nullptr) {
+        __stcs(mean + idx, m);
+    }
+
+    // rstd
+    sum = 0.0f;
+    for (int j = 0; j < C / 4 / warp.size(); j++) {
+        float diffx = reg_tmp[j].x - m;
+        float diffy = reg_tmp[j].y - m;
+        float diffz = reg_tmp[j].z - m;
+        float diffw = reg_tmp[j].w - m;
+        sum += diffx * diffx + diffy * diffy + diffz * diffz + diffw * diffw;
+    }
+    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    float s = rsqrtf(sum / C + 1e-5f);
+    if(warp.thread_rank() == 0 && rstd != nullptr) {
+        __stcs(rstd + idx, s);
+    }
+
+    // final normalization and scaling by weight/bias
+    float* o = out + idx * C;
+    for (int i = warp.thread_rank(), j = 0; i < C / 4; i += warp.size(), j++) {
+        reg_tmp[j].x = s * (reg_tmp[j].x - m) * weight[i * 4] + bias[i * 4];
+        reg_tmp[j].y = s * (reg_tmp[j].y - m) * weight[i * 4 + 1] + bias[i * 4 + 1];
+        reg_tmp[j].z = s * (reg_tmp[j].z - m) * weight[i * 4 + 2] + bias[i * 4 + 2];
+        reg_tmp[j].w = s * (reg_tmp[j].w - m) * weight[i * 4 + 3] + bias[i * 4 + 3];
+        __stcs(reinterpret_cast<float4 *>(o)+i, reg_tmp[j]);
+    }
+}
+
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -400,6 +463,19 @@ void layernorm_forward5(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
+
+void layernorm_forward6(float* out, float* mean, float* rstd,
+                       const float* inp, const float* weight, const float* bias,
+                       int B, int T, int C,
+                       const int block_size) {
+    assert(block_size % 32 == 0);
+    const int N = B * T;
+    const int grid_size = N;
+    layernorm_forward_kernel6<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
+
 // kernel version dispatch
 void layernorm_forward(int kernel_num,
                     float* out, float* mean, float* rstd,
@@ -421,6 +497,9 @@ void layernorm_forward(int kernel_num,
             break;
         case 5:
             layernorm_forward5(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
+            break;
+        case 6:
+            layernorm_forward6(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
