@@ -746,7 +746,8 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
             size_t param_elements[NUM_PARAMETER_TENSORS];
             size_t param_sizeof[NUM_PARAMETER_TENSORS];
             GPT2Config wave_config = model->config;
-            wave_config.num_layers = 1;
+            // allocate space for two layers, so we can do double-buffering
+            wave_config.num_layers = 2;
             fill_in_parameter_sizes(param_elements, param_sizeof, wave_config);
             size_t alloc_bytes = 0;
             for(int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
@@ -834,7 +835,7 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
         floatX* l_fcw = params.fcw + l * 4*C * C;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
         // get the pointers of the gradients of the weights for this layer
-        ptrdiff_t grad_l = multi_gpu_config.zero_stage == 2 ? 0 : l;
+        ptrdiff_t grad_l = multi_gpu_config.zero_stage == 2 ? l % 2 : l;
         floatX* dl_ln1w = grads.ln1w + grad_l * C;
         floatX* dl_ln1b = grads.ln1b + grad_l * C;
         floatX* dl_qkvw = grads.qkvw + grad_l * 3*C * C;
@@ -918,12 +919,27 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
                 4 * C * C, 4 * C,
                 C * 4 * C, C
             };
+            if(multi_gpu_config.zero_stage == 2) {
+#if MULTI_GPU
+                // wait for last layer's transfer to be completed, so we don't get any race conditions
+                // where main stream is writing to a buffer that nccl stream is reading
+                // this will result in a structure as follows:
+                // Main stream:     Calculate grads of layer 1 in buffer 1
+                // NCCL stream:     Wait for main stream
+                // Main stream:     Calculate grads of layer 2 in buffer 2
+                // NCCL stream:     Transmit data from buffer 1
+                // SYNC NNCL stream
+                // NCCL stream:     Wait for buffer 2 to be ready
+                // Main stream:     calculate grads of layer 3 in buffer 1
+                // ...
+                cudaCheck(cudaStreamSynchronize(multi_gpu_config.nccl_stream));
+#endif
+            }
             multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
 
             if(multi_gpu_config.zero_stage == 2) {
 #if MULTI_GPU
-                // wait for all data to be transferred
-                cudaCheck(cudaStreamSynchronize(multi_gpu_config.nccl_stream));
+
                 // and scatter-add it to the local shard buffers
                 // why can't we just scatter-add into the shard buffer directly?
                 // because that would overwrite any existing values there, which
