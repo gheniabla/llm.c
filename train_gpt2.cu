@@ -921,6 +921,7 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
             multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
 
             if(multi_gpu_config.zero_stage == 2) {
+#if MULTI_GPU
                 // wait for all data to be transferred
                 cudaCheck(cudaStreamSynchronize(multi_gpu_config.nccl_stream));
                 // and scatter-add it to the local shard buffers
@@ -946,6 +947,7 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
                     cudaCheck(cudaGetLastError());
                     cudaCheck(cudaMemset(pointers[i], 0, nelem[i] * sizeof(floatX)));
                 }
+#endif
             }
         }
     }
@@ -958,6 +960,7 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
         const size_t nelem[] = {Vp * C, T * C, C, C};
         multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
         if(multi_gpu_config.zero_stage == 2) {
+#if MULTI_GPU
             // wait for all data to be transferred
             cudaCheck(cudaStreamSynchronize(multi_gpu_config.nccl_stream));
             ParameterTensors g = model->grad_shards;
@@ -974,6 +977,7 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
                 cudaCheck(cudaGetLastError());
                 cudaCheck(cudaMemset(pointers[i], 0, nelem[i] * sizeof(floatX)));
             }
+#endif
         }
     }
 
