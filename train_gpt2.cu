@@ -89,14 +89,14 @@ void set_zero_configs(MultiGpuConfig* multi_gpu_config, int zero_stage, size_t t
     if (zero_stage == 0) {
         printf0("| Zero Optimization is disabled                                              |\n");
     }
-    else if (zero_stage == 1) {
+    else if (zero_stage == 1 || zero_stage == 2) {
         if (total_parameters % multi_gpu_config->num_processes != 0) {
             printf0("| Zero Optimization is disabled, Can't equally partition parameters          |\n");
             multi_gpu_config->zero_stage = 0;
         }
         else {
-            printf0("| Zero Stage1 is enabled                                                     |\n");
-            multi_gpu_config->zero_stage = 1;
+            printf0("| Zero Stage %d is enabled                                                    |\n", zero_stage);
+            multi_gpu_config->zero_stage = zero_stage;
             multi_gpu_config->shard_num_parameters = total_parameters / multi_gpu_config->num_processes;
         }
     }
@@ -308,7 +308,11 @@ typedef struct {
     size_t num_parameters_bytes;
     // gradients of the weights
     ParameterTensors grads;
+    size_t grads_bytes;
+    ParameterTensors grad_shards;   // ZeRO-2 gradient shards
+    size_t grad_shards_bytes;
     void* grads_memory;
+    void* grad_shards_memory;
     // buffers for the AdamW optimizer
     float* m_memory;
     float* v_memory;
@@ -352,6 +356,7 @@ void gpt2_init_common(GPT2 *model) {
     model->mean_loss = -1.0f; // -1.0f designates no loss, set at end of forward()
     // memory lazily initialized in backward()
     model->grads_memory = NULL;
+    model->grad_shards_memory = NULL;
     model->workload_indices = NULL; // on cpu, for encoder_backward
     model->bucket_info = NULL; // on cpu, for encoder_backward
     // memory lazily initialized in update()
@@ -716,7 +721,10 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
 void gpt2_zero_grad(GPT2 *model) {
     NVTX_RANGE_FN();
     if (model->grads_memory != NULL) {
-        cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(floatX)));
+        cudaCheck(cudaMemset(model->grads_memory, 0, model->grads_bytes));
+    }
+    if(model->grad_shards_memory != NULL) {
+        cudaCheck(cudaMemset(model->grad_shards_memory, 0, model->grad_shards_bytes));
     }
     cudaCheck(cudaDeviceSynchronize());
 }
@@ -733,8 +741,39 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
     if (model->grads_memory == NULL) {
         NvtxRange rng("InitGrads");
         // allocate buffers for weight gradients
-        printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
-        model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
+        if(multi_gpu_config.zero_stage == 2) {
+            // Allocate parameter buffers for the current layers active "wave" of computation
+            size_t param_elements[NUM_PARAMETER_TENSORS];
+            size_t param_sizeof[NUM_PARAMETER_TENSORS];
+            GPT2Config wave_config = model->config;
+            wave_config.num_layers = 1;
+            fill_in_parameter_sizes(param_elements, param_sizeof, wave_config);
+            size_t alloc_bytes = 0;
+            for(int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
+                alloc_bytes += param_sizeof[i] * param_elements[i];
+            }
+            printf0("allocating %d MiB for ZeRO-2 active gradients\n",
+                    (int) round(alloc_bytes / (1024 * 1024)));
+            model->grads_memory = malloc_and_point_parameters(&model->grads, param_elements, param_sizeof);
+            model->grads_bytes = alloc_bytes;
+
+            alloc_bytes = 0;
+            fill_in_parameter_sizes(param_elements, param_sizeof, model->config);
+            for(int i = 0; i < NUM_PARAMETER_TENSORS; ++i) {
+                param_elements[i] /= multi_gpu_config.num_processes;
+                alloc_bytes += param_sizeof[i] * param_elements[i];
+            }
+            printf0("allocating %d MiB for ZeRO-2 gradient shards\n",
+                    (int) round(alloc_bytes / (1024 * 1024)));
+            model->grad_shards_memory = malloc_and_point_parameters(&model->grad_shards, param_elements, param_sizeof);
+            model->grad_shards_bytes = alloc_bytes;
+        } else {
+            printf0("allocating %d MiB for parameter gradients\n",
+                    (int) round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
+            model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements,
+                                                              model->param_sizeof);
+            model->grads_bytes = model->num_parameters * sizeof(floatX);
+        }
         // init gradients of parameters and activations to zero
         gpt2_zero_grad(model);
         // initialise cpu scratch buffers for encoder backward
@@ -795,18 +834,19 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
         floatX* l_fcw = params.fcw + l * 4*C * C;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
         // get the pointers of the gradients of the weights for this layer
-        floatX* dl_ln1w = grads.ln1w + l * C;
-        floatX* dl_ln1b = grads.ln1b + l * C;
-        floatX* dl_qkvw = grads.qkvw + l * 3*C * C;
-        floatX* dl_qkvb = grads.qkvb + l * 3*C;
-        floatX* dl_attprojw = grads.attprojw + l * C * C;
-        floatX* dl_attprojb = grads.attprojb + l * C;
-        floatX* dl_ln2w = grads.ln2w + l * C;
-        floatX* dl_ln2b = grads.ln2b + l * C;
-        floatX* dl_fcw = grads.fcw + l * 4*C * C;
-        floatX* dl_fcb = grads.fcb + l * 4*C;
-        floatX* dl_fcprojw = grads.fcprojw + l * C * 4*C;
-        floatX* dl_fcprojb = grads.fcprojb + l * C;
+        ptrdiff_t grad_l = multi_gpu_config.zero_stage == 2 ? 0 : l;
+        floatX* dl_ln1w = grads.ln1w + grad_l * C;
+        floatX* dl_ln1b = grads.ln1b + grad_l * C;
+        floatX* dl_qkvw = grads.qkvw + grad_l * 3*C * C;
+        floatX* dl_qkvb = grads.qkvb + grad_l * 3*C;
+        floatX* dl_attprojw = grads.attprojw + grad_l * C * C;
+        floatX* dl_attprojb = grads.attprojb + grad_l * C;
+        floatX* dl_ln2w = grads.ln2w + grad_l * C;
+        floatX* dl_ln2b = grads.ln2b + grad_l * C;
+        floatX* dl_fcw = grads.fcw + grad_l * 4*C * C;
+        floatX* dl_fcb = grads.fcb + grad_l * 4*C;
+        floatX* dl_fcprojw = grads.fcprojw + grad_l * C * 4*C;
+        floatX* dl_fcprojb = grads.fcprojb + grad_l * C;
         // get the pointers of the activations for this layer
         floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
         floatX* l_ln1_mean = acts.ln1_mean + l * B * T;
@@ -861,7 +901,7 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, main_stream);
 
         // Accumulate gradients from this layer in a background stream.
-        if(last_step) {
+        if(last_step || multi_gpu_config.zero_stage == 2) {
             floatX* const pointers[] = {
                 dl_ln1w, dl_ln1b,
                 dl_qkvw, dl_qkvb,
@@ -879,16 +919,62 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
                 C * 4 * C, C
             };
             multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
+
+            if(multi_gpu_config.zero_stage == 2) {
+                // wait for all data to be transferred
+                cudaCheck(cudaStreamSynchronize(multi_gpu_config.nccl_stream));
+                // and scatter-add it to the local shard buffers
+                // why can't we just scatter-add into the shard buffer directly?
+                // because that would overwrite any existing values there, which
+                // we need for grad accumulation
+
+                ParameterTensors g = model->grad_shards;
+                floatX* const dst_ptr[] = {
+                    g.ln1w, g.ln1b,
+                    g.qkvw, g.qkvb,
+                    g.attprojw, g.attprojb,
+                    g.ln2w, g.ln2b,
+                    g.fcw, g.fcb,
+                    g.fcprojw, g.fcprojb
+                };
+
+                for(int i = 0; i < sizeof(nelem)/sizeof(nelem[0]); ++i) {
+                    size_t n = nelem[i] / multi_gpu_config.num_processes;
+                    vector_add<<<CEIL_DIV(n, 512), 512, 0, main_stream>>>(dst_ptr[i] + l * n,
+                                                           pointers[i] + multi_gpu_config.process_rank * n,
+                                                           n);
+                    cudaCheck(cudaGetLastError());
+                    cudaCheck(cudaMemset(pointers[i], 0, nelem[i] * sizeof(floatX)));
+                }
+            }
         }
     }
     encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
                      dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), main_stream);
 
     // Aggregate all gradients that are not part of the transformer blocks
-    if(last_step) {
+    if(last_step || multi_gpu_config.zero_stage == 2) {
         floatX* const pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
         const size_t nelem[] = {Vp * C, T * C, C, C};
         multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
+        if(multi_gpu_config.zero_stage == 2) {
+            // wait for all data to be transferred
+            cudaCheck(cudaStreamSynchronize(multi_gpu_config.nccl_stream));
+            ParameterTensors g = model->grad_shards;
+            floatX* const dst_ptr[] = {
+                g.wte, g.wpe,
+                g.lnfw, g.lnfb,
+            };
+
+            for(int i = 0; i < sizeof(nelem)/sizeof(nelem[0]); ++i) {
+                size_t n = nelem[i] / multi_gpu_config.num_processes;
+                vector_add<<<CEIL_DIV(n, 512), 512, 0, main_stream>>>(dst_ptr[i],
+                                                       pointers[i] + multi_gpu_config.process_rank * n,
+                                                       n);
+                cudaCheck(cudaGetLastError());
+                cudaCheck(cudaMemset(pointers[i], 0, nelem[i] * sizeof(floatX)));
+            }
+        }
     }
 
     cudaCheck(cudaDeviceSynchronize());
@@ -992,11 +1078,16 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
         // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
         grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
-    } else {
+    } else if(multi_gpu_config->zero_stage == 0) {
         // in regular DDP, backward has averaged the gradients across all GPUs
         // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
         global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, 0, 1, true, main_stream);
         cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
+    } else if(multi_gpu_config->zero_stage == 2) {
+        // our gradient shards are contiguous in memory, so taking a (partial) global norm is easy
+        global_norm_squared(grad_norm_squared, (floatX*)model->grad_shards_memory, model->num_parameters / multi_gpu_config->num_processes, 0, 1, true, main_stream);
+        cudaCheck(cudaMemcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float), cudaMemcpyDeviceToHost));
+        grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
     }
 
     if(!isfinite(grad_norm_squared_cpu)) {
@@ -1030,6 +1121,9 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
         floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
         floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
+        if(multi_gpu_config->zero_stage == 2) {
+            grad_ptr = (floatX*)model->grad_shards_memory + local_offset_partial;
+        }
 
         ptrdiff_t opt_state_offset = multi_gpu_config->zero_stage < 1 ?  local_offset_full : local_offset_partial;
         float* m_ptr = model->m_memory + opt_state_offset;
@@ -1046,7 +1140,7 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         // ok finally call the kernel
         adamw_update(param_ptr, master_ptr, grad_ptr,
                      m_ptr, v_ptr,
-                     shard.size, tensor.size, tensor.size, shard.size, num_layers,
+                     shard.size, tensor.size, multi_gpu_config->zero_stage == 2 ? shard.size : tensor.size, shard.size, num_layers,
                      learning_rate,
                      beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
         cudaCheck(cudaGetLastError());
@@ -1102,6 +1196,7 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
 void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->params_memory));
     cudaCheck(cudaFree(model->grads_memory));
+    cudaCheck(cudaFree(model->grad_shards_memory));
     cudaCheck(cudaFree(model->m_memory));
     cudaCheck(cudaFree(model->v_memory));
     cudaCheck(cudaFree(model->master_weights));
