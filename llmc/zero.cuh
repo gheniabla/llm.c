@@ -212,7 +212,7 @@ void multi_gpu_async_reduce_gradient(
                 ncclFloatX, ncclAvg,
                 multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream
             ));
-        } else if(multi_gpu_config->zero_stage == 1) {
+        } else if(multi_gpu_config->zero_stage == 1 || multi_gpu_config->zero_stage == 2) {
             assert(pointers_sizes[i] % multi_gpu_config->num_processes == 0);
             size_t shard_size = pointers_sizes[i] / multi_gpu_config->num_processes;
             ptrdiff_t shard_offset = (ptrdiff_t)shard_size * multi_gpu_config->process_rank;
