@@ -502,7 +502,7 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     // so that we can match them up and get correctness and exactly the same initial conditions
     size_t L = model->config.num_layers;
     size_t offset = 0;
-    for (int l = 0; l < L; l++) {
+    for (ptrdiff_t l = 0; l < L; l++) {
         offset = 0;
         for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
             // the layernorm parameters are all initialized to 1
@@ -618,7 +618,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
     // first layernorm isn't fused
     layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
 
-    for (int l = 0; l < L; l++) {
+    for (ptrdiff_t l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
 
         floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
@@ -779,7 +779,7 @@ void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
     floatX* dl_btc = residual;
 
     // now backward all the layers
-    for (int l = L-1; l >= 0; l--) {
+    for (ptrdiff_t l = L-1; l >= 0; l--) {
         NvtxRange layer_range("Layer", l);
 
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
@@ -1510,8 +1510,8 @@ int main(int argc, char *argv[]) {
     // build an EvalLoader for HellaSwag
     EvalLoader eval_loader;
     const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
-    const char hellaswag_available = access(hellaswag_path, F_OK) == 0;
-    const char run_hellaswag = hellaswag_eval && hellaswag_available;
+    const bool hellaswag_available = access(hellaswag_path, F_OK) == 0;
+    const bool run_hellaswag = hellaswag_eval && hellaswag_available;
     if (run_hellaswag) {
         evalloader_init(&eval_loader, hellaswag_path, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
     }
@@ -1628,7 +1628,7 @@ int main(int argc, char *argv[]) {
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
                 // get the V-dimensional vector probs[0, t-1, :]
-                floatX* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
+                floatX* logits = model.acts.output + (ptrdiff_t)(t - 1) * model.config.padded_vocab_size;
                 // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
                 cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model.config.vocab_size * sizeof(floatX), cudaMemcpyDeviceToHost));
                 // convert to FP32 into cpu_logits (this does nothing useful if floatX == float)
