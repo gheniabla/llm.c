@@ -1437,7 +1437,7 @@ int main(int argc, char *argv[]) {
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
-    const char* load_filename = "d12"; // bf16 weights of the model
+    const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
     const char* lr_scheduler_type = "cosine";
     const char* output_log_dir = NULL;
     int checkpoint_every = 0; // write checkpoints every how many steps?
@@ -1514,8 +1514,8 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 's' && argv[i][2] == 'g') { skip_update_gradz = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'p' && argv[i][2] == 'm') { use_mup = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'p' && argv[i][2] == 'w') { mup_width_mult = atof(argv[i+1]); }
+        else if (argv[i][1] == 'w' && argv[i][2] == 'i') { use_mup = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'w' && argv[i][2] == 'm') { mup_width_mult = atof(argv[i+1]); }
         else { error_usage(); }
     }
     multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
