@@ -105,7 +105,7 @@ __global__ void reduce_add_sum_kernel(floatX* dst, const float* src, size_t n, s
 // https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
 void matmul_forward_cublaslt(floatX* out,
                      floatX* inp, floatX* weight, floatX* bias,
-                     int B, int T, int C, int OC, cudaStream_t stream) {
+                     int B, int T, int C, int OC, float* coord_check_data, int cc_cnt, cudaStream_t stream) {
     NVTX_RANGE_FN();
     int has_bias = (bias != NULL);
 
@@ -171,6 +171,10 @@ void matmul_forward_cublaslt(floatX* out,
     cublasCheck(cublasLtMatrixLayoutDestroy(inputLayout));
     cublasCheck(cublasLtMatrixLayoutDestroy(outputLayout));
     cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
+    // data collection
+    if (coord_check_data != NULL) {
+        coord_check_data[cc_cnt] = get_mean_l1_summary(out, B*T*OC);
+    }
 }
 
 void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
