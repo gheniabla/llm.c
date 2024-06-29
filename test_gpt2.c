@@ -52,7 +52,7 @@ int main(int argc, char *argv[]) {
     FILE *state_file = fopen("gpt2_124M_debug_state.bin", "rb");
     if (state_file == NULL) { printf("Error opening state file\n"); return 1; }
     int state_header[256];
-    fread(state_header, sizeof(int), 256, state_file);
+    freadCheck(state_header, sizeof(int), 256, state_file);
     if (state_header[0] != 20240327) { printf("Bad magic state file\n"); return 1; }
     if (state_header[1] != 2) {
         printf("Bad version in state file\n");
@@ -75,12 +75,12 @@ int main(int argc, char *argv[]) {
     float* expected_loss = (float*) malloc(1 * sizeof(float));
 
     // read reference information from Python
-    fread(x, sizeof(int), B*T, state_file);
-    fread(y, sizeof(int), B*T, state_file);
-    fread(expected_logits, sizeof(float), B*T*V, state_file);
-    fread(expected_loss, sizeof(float), 1, state_file);
-    fread(expected_grads_memory, sizeof(float), model.num_parameters, state_file);
-    fclose(state_file);
+    freadCheck(x, sizeof(int), B*T, state_file);
+    freadCheck(y, sizeof(int), B*T, state_file);
+    freadCheck(expected_logits, sizeof(float), B*T*V, state_file);
+    freadCheck(expected_loss, sizeof(float), 1, state_file);
+    freadCheck(expected_grads_memory, sizeof(float), model.num_parameters, state_file);
+    fcloseCheck(state_file);
 
     // overall OK signal for the test
     int allok = 1;

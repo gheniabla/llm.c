@@ -816,7 +816,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     ActivationTensors acts = model->acts;
     float* residual;
     encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
-    for (int l = 0; l < L; l++) {
+    for (ptrdiff_t l = 0; l < L; l++) {
 
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
@@ -930,7 +930,7 @@ void gpt2_backward(GPT2 *model) {
     float* dresidual = grads_acts.residual3 + (L-1) * B * T * C; // write to last layer's residual
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
 
-    for (int l = L-1; l >= 0; l--) {
+    for (ptrdiff_t l = L-1; l >= 0; l--) {
 
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
         dresidual = l == 0 ? grads_acts.encoded : grads_acts.residual3 + (l-1) * B * T * C;
@@ -1133,7 +1133,7 @@ int main() {
                 // we're in principle running B "inference streams" in parallel here
                 // but only using position 0
                 // get the Vp-dimensional vector probs[0, t-1, :]
-                float* probs = model.acts.probs + (t-1) * model.config.padded_vocab_size;
+                float* probs = model.acts.probs + (ptrdiff_t)(t-1) * model.config.padded_vocab_size;
                 float coin = random_f32(&rng_state);
                 // note we're only sampling from the first V elements, ignoring padding
                 // (the probabilities in the padded region should be zero anyway)
